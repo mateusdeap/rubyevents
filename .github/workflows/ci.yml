@@ -3,15 +3,40 @@ name: CI
 on:
   pull_request:
     branches: ["*"]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/*.md'
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/*.md'
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true # Add this line to explicitly enable cancellation
+  cancel-in-progress: true
 
+# Reusable workflow for setup steps
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.generate-cache-key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Generate cache key
+        id: generate-cache-key
+        run: echo "key=${{ runner.os }}-${{ hashFiles('Gemfile.lock', 'yarn.lock', 'package.json') }}" >> $GITHUB_OUTPUT
+
+      # Pre-pull Docker images to speed up subsequent jobs
+      - name: Pull Docker images
+        run: docker pull getmeili/meilisearch:v1.1
+
   lint:
+    needs: setup
     runs-on: ubuntu-latest
     env:
       RAILS_ENV: test
@@ -31,7 +56,7 @@ jobs:
           cache: yarn
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: yarn install --frozen-lockfile --prefer-offline
 
       - name: StandardRB Check
         run: bundle exec standardrb
@@ -45,7 +70,8 @@ jobs:
       - name: erb-lint Check
         run: bundle exec erblint --lint-all
 
-  test:
+  test-unit:
+    needs: setup
     runs-on: ubuntu-latest
     env:
       RAILS_ENV: test
@@ -65,27 +91,113 @@ jobs:
           cache: yarn
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: yarn install --frozen-lockfile --prefer-offline
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
 
       - name: Meilisearch setup with Docker
         run: docker run -d -p 7700:7700 getmeili/meilisearch:v1.1 meilisearch --no-analytics
 
+      - name: Cache Vite build
+        uses: actions/cache@v3
+        with:
+          path: public/vite-test
+          key: ${{ runner.os }}-vite-${{ hashFiles('app/frontend/**') }}
+          restore-keys: |
+            ${{ runner.os }}-vite-
+
       - name: Build assets
         run: bin/vite build --clear --mode=test
 
+      - name: Cache test database
+        uses: actions/cache@v3
+        with:
+          path: tmp/db-cache
+          key: ${{ runner.os }}-db-${{ hashFiles('db/schema.rb') }}
+
       - name: Prepare database
         run: |
-          bin/rails db:create
-          bin/rails db:schema:load
+          mkdir -p tmp/db-cache
+          if [ ! -f tmp/db-cache/setup-complete ]; then
+            bin/rails db:create
+            bin/rails db:schema:load
+            touch tmp/db-cache/setup-complete
+          fi
 
-      - name: Run tests
+      - name: Run unit tests
+        run: bin/rails test
+
+  test-system:
+    needs: [setup, test-unit]
+    runs-on: ubuntu-latest
+    env:
+      RAILS_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler: default
+          bundler-cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --prefer-offline
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Meilisearch setup with Docker
+        run: docker run -d -p 7700:7700 getmeili/meilisearch:v1.1 meilisearch --no-analytics
+
+      - name: Cache Vite build
+        uses: actions/cache@v3
+        with:
+          path: public/vite-test
+          key: ${{ runner.os }}-vite-${{ hashFiles('app/frontend/**') }}
+          restore-keys: |
+            ${{ runner.os }}-vite-
+
+      - name: Build assets
+        run: bin/vite build --clear --mode=test
+
+      - name: Cache test database
+        uses: actions/cache@v3
+        with:
+          path: tmp/db-cache
+          key: ${{ runner.os }}-db-${{ hashFiles('db/schema.rb') }}
+
+      - name: Prepare database
         run: |
-          bin/rails test
-          bin/rails test:system
+          mkdir -p tmp/db-cache
+          if [ ! -f tmp/db-cache/setup-complete ]; then
+            bin/rails db:create
+            bin/rails db:schema:load
+            touch tmp/db-cache/setup-complete
+          fi
 
-      # - name: Smoke test database seeds
-      #   run: sudo bin/rails db:reset
+      - name: Run system tests
+        run: bin/rails test:system
+
   seed_smoke_test:
+    needs: setup
     runs-on: ubuntu-latest
     env:
       RAILS_ENV: test
@@ -106,10 +218,26 @@ jobs:
           cache: yarn
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: yarn install --frozen-lockfile --prefer-offline
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
 
       - name: Meilisearch setup with Docker
         run: docker run -d -p 7700:7700 getmeili/meilisearch:v1.1 meilisearch --no-analytics
+
+      - name: Cache Vite build
+        uses: actions/cache@v3
+        with:
+          path: public/vite-test
+          key: ${{ runner.os }}-vite-${{ hashFiles('app/frontend/**') }}
+          restore-keys: |
+            ${{ runner.os }}-vite-
 
       - name: Build assets
         run: bin/vite build --clear --mode=test
@@ -124,8 +252,9 @@ jobs:
 
       - name: Verify all thumbnails for child talks are present
         run: bin/rails verify_thumbnails
+
   deploy:
-    needs: [lint, test, seed_smoke_test]
+    needs: [lint, test-unit, test-system, seed_smoke_test]
     name: Deploy
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
@@ -151,6 +280,14 @@ jobs:
       - name: Expose GitHub Runtime for cache
         uses: crazy-max/ghaction-github-runtime@v3
 
+      - name: Cache Docker layers for deployment
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-deploy-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-deploy-
+
       - name: Setup SSH
         uses: webfactory/ssh-agent@v0.7.0
         with:
@@ -163,6 +300,7 @@ jobs:
           bundler-cache: true
 
       - name: Deploy with Kamal
+        id: deploy
         run: bundle exec kamal deploy
         env:
           KAMAL_RAILS_MASTER_KEY: ${{ secrets.KAMAL_RAILS_MASTER_KEY }}
